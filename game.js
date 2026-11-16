@@ -1,6 +1,10 @@
 // Galaxy Defender — Space Invaders style. Plain canvas JS, no assets.
 // Move: Arrows/WASD or drag. Shoot: Space/click/tap. P pause. M mute.
 // Clear 3 waves to win. Lose at 0 lives or if aliens reach the ground.
+//
+// Graphics: DPR-crisp canvas (cap 2), layered glow/bloom, 3-layer parallax
+// starfield + drifting nebula, particles, screen shake, hit flash, muzzle
+// flash. Effects auto-scale down on small screens to hold 60fps.
 'use strict';
 
 var W = 480, H = 640;
@@ -13,12 +17,18 @@ var startBtn = document.getElementById('start-btn');
 var sensSlider = document.getElementById('sensitivity');
 var sensValue = document.getElementById('sens-value');
 
-// Crisp canvas on high-DPI screens.
+// Crisp canvas on high-DPI screens (cap 2: phones stay fast).
 var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
 if (dpr > 2) dpr = 2;
 canvas.width = W * dpr;
 canvas.height = H * dpr;
 ctx.scale(dpr, dpr);
+
+// Quality auto-scaling: small screens get fewer particles and no
+// shadowBlur (the expensive effect) so the game still holds 60fps.
+var smallScreen = (typeof window !== 'undefined' && window.innerWidth && window.innerWidth < 480);
+var useGlow = !smallScreen;
+var particleScale = smallScreen ? 0.5 : 1;
 
 var ROW_POINTS = [30, 20, 20, 10, 10];
 var TOTAL_WAVES = 3;
@@ -38,6 +48,11 @@ var alienSpeed = 22;
 var waveClearTimer = 0;
 var invulnTimer = 0;
 var elapsed = 0;
+var shake = 0;            // screen shake magnitude, decays to 0
+var flashTimer = 0;       // hit-flash overlay timer
+var flashColor = '255,93,115';
+var muzzleTimer = 0;      // muzzle flash timer
+var winBurstTimer = 0;    // fireworks timer on the win screen
 
 try { highScore = parseInt(localStorage.getItem('galaxy-defender-high') || '0', 10) || 0; } catch (e) { highScore = 0; }
 
@@ -46,9 +61,28 @@ var bullets = [];      // player bullets {x,y}
 var alienBullets = []; // {x,y}
 var aliens = [];       // {x,y,w,h,row,alive}
 var particles = [];    // {x,y,vx,vy,life,color}
+
+// --- Parallax background: 3 star layers + drifting nebula clouds ---
 var stars = [];
-for (var i = 0; i < 90; i++) {
-  stars.push({ x: Math.random() * W, y: Math.random() * H, r: Math.random() * 1.6 + 0.4, tw: Math.random() * 6.28 });
+for (var i = 0; i < 110; i++) {
+  var layer = i % 3; // 0 far (slow, dim, small), 1 mid, 2 near (fast, bright)
+  stars.push({
+    x: Math.random() * W, y: Math.random() * H,
+    r: 0.5 + layer * 0.6 + Math.random() * 0.6,
+    tw: Math.random() * 6.28,
+    layer: layer,
+    speed: 6 + layer * 14
+  });
+}
+var NEBULA_COLORS = ['77,227,255', '180,90,255', '255,93,150', '80,255,160'];
+var nebulas = [];
+for (var n = 0; n < 5; n++) {
+  nebulas.push({
+    x: Math.random() * W, y: Math.random() * H,
+    r: 120 + Math.random() * 140,
+    color: NEBULA_COLORS[n % NEBULA_COLORS.length],
+    drift: (Math.random() - 0.5) * 4
+  });
 }
 
 var keys = {};
@@ -104,6 +138,7 @@ function resetGame() {
   player.x = W / 2 - 22; player.alive = true;
   bullets = []; alienBullets = []; particles = [];
   invulnTimer = 0; fireCooldown = 0; waveClearTimer = 0;
+  shake = 0; flashTimer = 0; muzzleTimer = 0;
   spawnWave(1);
   updateHUD();
 }
@@ -134,15 +169,18 @@ function gameOver(reason) {
   state = 'gameover';
   saveHigh();
   sfx('lose');
+  shake = 14;
+  flashTimer = 0.35; flashColor = '255,93,115';
   startBtn.textContent = 'PLAY AGAIN';
   updateHUD();
-  if (reason === 'invaded') spawnBurst(player.x + 22, player.y + 13, '#ff5d73', 40);
+  spawnBurst(player.x + 22, player.y + 13, '#ff5d73', 40);
 }
 
 function winGame() {
   state = 'win';
   saveHigh();
   sfx('win');
+  winBurstTimer = 0;
   startBtn.textContent = 'PLAY AGAIN';
   updateHUD();
 }
@@ -152,13 +190,20 @@ function shoot() {
   if (state !== 'playing' || fireCooldown > 0 || bullets.length >= 4) return;
   bullets.push({ x: player.x + player.w / 2 - 2, y: player.y - 8, w: 4, h: 14 });
   fireCooldown = 0.22;
+  muzzleTimer = 0.07;
   sfx('shoot');
 }
 
 function spawnBurst(x, y, color, n) {
-  for (var i = 0; i < n; i++) {
+  var count = Math.max(4, Math.round(n * particleScale));
+  for (var i = 0; i < count; i++) {
     var a = Math.random() * 6.283, sp = 40 + Math.random() * 160;
     particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.5 + Math.random() * 0.4, color: color });
+  }
+  // A few bright sparks fly farther and live longer.
+  for (var j = 0; j < Math.round(4 * particleScale); j++) {
+    var a2 = Math.random() * 6.283, sp2 = 180 + Math.random() * 140;
+    particles.push({ x: x, y: y, vx: Math.cos(a2) * sp2, vy: Math.sin(a2) * sp2, life: 0.7 + Math.random() * 0.3, color: '#ffffff' });
   }
 }
 
@@ -178,6 +223,42 @@ function hitTest(a, b) {
 }
 
 // ---------- Update ----------
+function updateBackground(dt) {
+  // Parallax starfield drifts down; layers move at different speeds.
+  for (var s = 0; s < stars.length; s++) {
+    var st = stars[s];
+    st.y += st.speed * dt;
+    if (st.y > H + 2) { st.y = -2; st.x = Math.random() * W; }
+  }
+  // Nebula clouds drift sideways slowly and wrap.
+  for (var nb = 0; nb < nebulas.length; nb++) {
+    var neb = nebulas[nb];
+    neb.x += neb.drift * dt;
+    if (neb.x < -neb.r) neb.x = W + neb.r;
+    if (neb.x > W + neb.r) neb.x = -neb.r;
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 34);
+  if (flashTimer > 0) flashTimer -= dt;
+  if (muzzleTimer > 0) muzzleTimer -= dt;
+  // Fireworks on the win screen.
+  if (state === 'win') {
+    winBurstTimer -= dt;
+    if (winBurstTimer <= 0) {
+      var colors = ['#4de3ff', '#ffe14d', '#ff5d73', '#7dff6a', '#b45aff'];
+      spawnBurst(60 + Math.random() * (W - 120), 100 + Math.random() * 220,
+        colors[Math.floor(Math.random() * colors.length)], 22);
+      winBurstTimer = 0.55;
+    }
+  }
+  // Particles keep animating on end screens too.
+  for (var p = particles.length - 1; p >= 0; p--) {
+    particles[p].x += particles[p].vx * dt;
+    particles[p].y += particles[p].vy * dt;
+    particles[p].life -= dt;
+    if (particles[p].life <= 0) particles.splice(p, 1);
+  }
+}
+
 function update(dt) {
   elapsed += dt;
   if (fireCooldown > 0) fireCooldown -= dt;
@@ -207,7 +288,7 @@ function update(dt) {
         updateHUD();
       }
     }
-    // Still update bullets/particles during the breather.
+    // Still update bullets during the breather.
   } else {
     // Alien formation movement: speed grows as aliens die.
     var step = alienSpeed * (1 + (40 - remaining) / 40);
@@ -263,6 +344,8 @@ function update(dt) {
       lives--;
       updateHUD();
       spawnBurst(player.x + 22, player.y + 13, '#ff5d73', 24);
+      shake = 10;
+      flashTimer = 0.18; flashColor = '255,93,115';
       sfx('playerHit');
       if (lives <= 0) { gameOver('shot'); return; }
       invulnTimer = 2;
@@ -270,36 +353,38 @@ function update(dt) {
       break;
     }
   }
-
-  // Particles.
-  for (var p = particles.length - 1; p >= 0; p--) {
-    particles[p].x += particles[p].vx * dt;
-    particles[p].y += particles[p].vy * dt;
-    particles[p].life -= dt;
-    if (particles[p].life <= 0) particles.splice(p, 1);
-  }
 }
 
 // ---------- Draw ----------
+function alienColor(row) {
+  return row === 0 ? '#ff5d73' : (row < 3 ? '#4de3ff' : '#7dff6a');
+}
+
 function drawAlien(a) {
   var cx = a.x + a.w / 2, cy = a.y + a.h / 2;
+  var color = alienColor(a.row);
   ctx.save();
-  ctx.shadowBlur = 10;
+  // Soft outer glow halo (cheap layered glow, no shadowBlur needed).
+  ctx.globalAlpha = 0.16;
+  ctx.fillStyle = color;
+  ctx.fillRect(a.x - 4, a.y - 4, a.w + 8, a.h + 8);
+  ctx.globalAlpha = 1;
+  if (useGlow) { ctx.shadowBlur = 10; ctx.shadowColor = color; }
   if (a.row === 0) { // top: red squid
-    ctx.fillStyle = '#ff5d73'; ctx.shadowColor = '#ff5d73';
+    ctx.fillStyle = color;
     ctx.fillRect(a.x + 6, a.y + 2, a.w - 12, 12);
     ctx.fillRect(a.x + 2, a.y + 12, a.w - 4, 6);
     ctx.fillRect(a.x + 6, a.y + 18, 5, 6);
     ctx.fillRect(a.x + a.w - 11, a.y + 18, 5, 6);
   } else if (a.row < 3) { // middle: cyan crab
-    ctx.fillStyle = '#4de3ff'; ctx.shadowColor = '#4de3ff';
+    ctx.fillStyle = color;
     ctx.fillRect(a.x + 4, a.y + 4, a.w - 8, 12);
     ctx.fillRect(a.x, a.y + 10, 6, 6);
     ctx.fillRect(a.x + a.w - 6, a.y + 10, 6, 6);
     ctx.fillRect(a.x + 8, a.y + 18, 5, 6);
     ctx.fillRect(a.x + a.w - 13, a.y + 18, 5, 6);
   } else { // bottom: green octopus
-    ctx.fillStyle = '#7dff6a'; ctx.shadowColor = '#7dff6a';
+    ctx.fillStyle = color;
     ctx.fillRect(a.x + 8, a.y, a.w - 16, 14);
     ctx.fillRect(a.x + 4, a.y + 12, 6, 10);
     ctx.fillRect(a.x + 14, a.y + 12, 6, 10);
@@ -316,7 +401,13 @@ function drawShip() {
   if (invulnTimer > 0 && Math.floor(elapsed * 10) % 2 === 0) return; // blink
   var cx = player.x + player.w / 2;
   ctx.save();
-  ctx.shadowColor = '#4de3ff'; ctx.shadowBlur = 14;
+  // Engine glow trail under the ship.
+  var trail = ctx.createLinearGradient(0, player.y + player.h, 0, player.y + player.h + 16);
+  trail.addColorStop(0, 'rgba(77,227,255,0.55)');
+  trail.addColorStop(1, 'rgba(77,227,255,0)');
+  ctx.fillStyle = trail;
+  ctx.fillRect(cx - 6, player.y + player.h, 12, 16);
+  if (useGlow) { ctx.shadowColor = '#4de3ff'; ctx.shadowBlur = 14; }
   ctx.fillStyle = '#4de3ff';
   ctx.beginPath();
   ctx.moveTo(cx, player.y);
@@ -325,9 +416,20 @@ function drawShip() {
   ctx.lineTo(player.x + 8, player.y + player.h - 6);
   ctx.lineTo(player.x, player.y + player.h);
   ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0;
   ctx.fillStyle = '#ffe14d';
   ctx.beginPath(); ctx.arc(cx, player.y + 12, 4, 0, 6.283); ctx.fill();
   ctx.restore();
+  // Muzzle flash: bright starburst at the nose right after firing.
+  if (muzzleTimer > 0) {
+    var m = muzzleTimer / 0.07;
+    ctx.save();
+    ctx.globalAlpha = m;
+    ctx.fillStyle = '#fff6b0';
+    if (useGlow) { ctx.shadowColor = '#ffe14d'; ctx.shadowBlur = 18; }
+    ctx.beginPath(); ctx.arc(cx, player.y - 4, 4 + 8 * m, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
 }
 
 function drawTextCenter(text, y, size, color, glow) {
@@ -335,38 +437,68 @@ function drawTextCenter(text, y, size, color, glow) {
   ctx.font = 'bold ' + size + 'px "Courier New", monospace';
   ctx.textAlign = 'center';
   ctx.fillStyle = color;
-  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = 16; }
+  if (glow && useGlow) { ctx.shadowColor = color; ctx.shadowBlur = 16; }
   ctx.fillText(text, W / 2, y);
+  ctx.restore();
+}
+
+function drawBackground() {
+  var g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0b0a2a');
+  g.addColorStop(0.55, '#0a0a24');
+  g.addColorStop(1, '#070718');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // Nebula clouds: big soft radial gradients, very low alpha.
+  for (var nb = 0; nb < nebulas.length; nb++) {
+    var neb = nebulas[nb];
+    var rg = ctx.createRadialGradient(neb.x, neb.y, 0, neb.x, neb.y, neb.r);
+    rg.addColorStop(0, 'rgba(' + neb.color + ',0.14)');
+    rg.addColorStop(1, 'rgba(' + neb.color + ',0)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(neb.x - neb.r, neb.y - neb.r, neb.r * 2, neb.r * 2);
+  }
+  // Parallax stars: near layers brighter and bigger.
+  ctx.save();
+  for (var s = 0; s < stars.length; s++) {
+    var st = stars[s];
+    var alpha = (0.35 + st.layer * 0.25) * (0.5 + 0.5 * Math.abs(Math.sin(elapsed + st.tw)));
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = st.layer === 2 ? '#ffffff' : '#cfe8ff';
+    ctx.fillRect(st.x, st.y, st.r, st.r);
+  }
   ctx.restore();
 }
 
 function draw() {
   ctx.clearRect(0, 0, W, H);
-  var g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, '#0a0a24');
-  g.addColorStop(1, '#070718');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, W, H);
-  // Stars.
   ctx.save();
-  for (var s = 0; s < stars.length; s++) {
-    var st = stars[s];
-    ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(elapsed + st.tw));
-    ctx.fillStyle = '#cfe8ff';
-    ctx.fillRect(st.x, st.y, st.r, st.r);
+  // Screen shake: small random offset while shake > 0.
+  if (shake > 0) {
+    ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
   }
-  ctx.restore();
+  drawBackground();
 
   if (state === 'title') {
-    drawTextCenter('GALAXY DEFENDER', 150, 34, '#4de3ff', true);
-    drawTextCenter('Shoot the aliens. Clear 3 waves.', 200, 16, '#e8f4ff', false);
-    drawTextCenter('Move: Arrows / WASD or drag', 250, 15, '#9fd8ff', false);
-    drawTextCenter('Shoot: Space / click / tap', 278, 15, '#9fd8ff', false);
-    drawTextCenter('P pause   M mute', 306, 15, '#9fd8ff', false);
-    drawTextCenter('Sensitivity slider below adjusts', 334, 15, '#9fd8ff', false);
-    drawTextCenter('ship speed live.', 356, 15, '#9fd8ff', false);
-    drawTextCenter('Press ENTER or tap START', 420, 18, '#ffe14d', true);
-    if (highScore > 0) drawTextCenter('HIGH SCORE ' + highScore, 470, 15, '#ffe14d', false);
+    ctx.restore();
+    var pulse = 0.75 + 0.25 * Math.sin(elapsed * 3);
+    ctx.save();
+    ctx.globalAlpha = pulse;
+    drawTextCenter('GALAXY DEFENDER', 140, 34, '#4de3ff', true);
+    ctx.restore();
+    drawTextCenter('Shoot the aliens. Clear 3 waves.', 195, 16, '#e8f4ff', false);
+    // Show the three alien types as a preview row.
+    drawAlien({ x: W / 2 - 90, y: 220, w: 34, h: 26, row: 0, alive: true });
+    drawAlien({ x: W / 2 - 17, y: 220, w: 34, h: 26, row: 1, alive: true });
+    drawAlien({ x: W / 2 + 56, y: 220, w: 34, h: 26, row: 3, alive: true });
+    drawTextCenter('30 pts        20 pts        10 pts', 268, 14, '#9fd8ff', false);
+    drawTextCenter('Move: Arrows / WASD or drag', 310, 15, '#9fd8ff', false);
+    drawTextCenter('Shoot: Space / click / tap', 338, 15, '#9fd8ff', false);
+    drawTextCenter('P pause   M mute', 366, 15, '#9fd8ff', false);
+    drawTextCenter('Sensitivity slider below adjusts', 394, 15, '#9fd8ff', false);
+    drawTextCenter('ship speed live.', 416, 15, '#9fd8ff', false);
+    drawTextCenter('Press ENTER or tap START', 470, 18, '#ffe14d', true);
+    if (highScore > 0) drawTextCenter('HIGH SCORE ' + highScore, 510, 15, '#ffe14d', false);
     return;
   }
 
@@ -380,7 +512,7 @@ function draw() {
   drawShip();
 
   ctx.save();
-  ctx.shadowBlur = 8;
+  if (useGlow) ctx.shadowBlur = 8;
   bullets.forEach(function (b) {
     ctx.fillStyle = '#ffe14d'; ctx.shadowColor = '#ffe14d';
     ctx.fillRect(b.x, b.y, b.w, b.h);
@@ -390,11 +522,22 @@ function draw() {
     ctx.fillRect(b.x, b.y, b.w, b.h);
   });
   particles.forEach(function (p) {
+    ctx.shadowBlur = 0;
     ctx.globalAlpha = Math.max(0, p.life * 2);
     ctx.fillStyle = p.color;
     ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
   });
   ctx.restore();
+
+  // Hit flash overlay (fades fast).
+  if (flashTimer > 0) {
+    ctx.save();
+    ctx.globalAlpha = Math.min(0.35, flashTimer * 1.2);
+    ctx.fillStyle = 'rgb(' + flashColor + ')';
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+    ctx.restore();
+  }
+  ctx.restore(); // end shake transform
 
   if (state === 'paused') {
     ctx.fillStyle = 'rgba(5,5,16,0.7)';
@@ -402,18 +545,23 @@ function draw() {
     drawTextCenter('PAUSED', 300, 36, '#ffe14d', true);
     drawTextCenter('P to resume', 340, 16, '#e8f4ff', false);
   } else if (state === 'gameover') {
-    ctx.fillStyle = 'rgba(5,5,16,0.7)';
+    ctx.fillStyle = 'rgba(5,5,16,0.72)';
     ctx.fillRect(0, 0, W, H);
     drawTextCenter('GAME OVER', 280, 36, '#ff5d73', true);
     drawTextCenter('SCORE ' + score + '   HIGH ' + highScore, 330, 18, '#e8f4ff', false);
     drawTextCenter('Press ENTER to play again', 380, 16, '#ffe14d', false);
   } else if (state === 'win') {
-    ctx.fillStyle = 'rgba(5,5,16,0.7)';
+    ctx.fillStyle = 'rgba(5,5,16,0.55)';
     ctx.fillRect(0, 0, W, H);
-    drawTextCenter('YOU WIN!', 280, 36, '#7dff6a', true);
-    drawTextCenter('All 3 waves cleared!', 320, 18, '#e8f4ff', false);
-    drawTextCenter('SCORE ' + score + '   HIGH ' + highScore, 355, 18, '#e8f4ff', false);
-    drawTextCenter('Press ENTER to play again', 400, 16, '#ffe14d', false);
+    var wpulse = 0.8 + 0.2 * Math.sin(elapsed * 3);
+    ctx.save();
+    ctx.globalAlpha = wpulse;
+    drawTextCenter('YOU WIN!', 280, 40, '#7dff6a', true);
+    ctx.restore();
+    drawTextCenter('All 3 waves cleared!', 325, 18, '#e8f4ff', false);
+    drawTextCenter('The galaxy is safe... for now.', 352, 15, '#9fd8ff', false);
+    drawTextCenter('SCORE ' + score + '   HIGH ' + highScore, 388, 18, '#e8f4ff', false);
+    drawTextCenter('Press ENTER to play again', 425, 16, '#ffe14d', false);
   }
 }
 
@@ -425,6 +573,7 @@ function loop(ts) {
   lastTs = ts;
   if (state === 'playing') update(dt);
   else elapsed += dt;
+  updateBackground(dt);
   draw();
 }
 requestAnimationFrame(loop);
@@ -489,10 +638,13 @@ window.__galaxy = {
   get lives() { return lives; },
   get wave() { return wave; },
   get sensitivity() { return sensitivity; },
+  get useGlow() { return useGlow; },
+  get particleScale() { return particleScale; },
   player: player,
   get aliens() { return aliens; },
   get bullets() { return bullets; },
   get alienBullets() { return alienBullets; },
+  get particles() { return particles; },
   start: startGame,
   shoot: shoot,
   setLives: function (n) { lives = n; updateHUD(); },
