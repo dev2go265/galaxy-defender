@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Galaxy Defender</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="game-box">
+  <h1>GALAXY DEFENDER</h1>
+  <div class="hud">
+    <span id="hud-score">SCORE 0</span>
+    <span id="hud-wave">WAVE 1</span>
+    <span id="hud-lives">&hearts;&hearts;&hearts;</span>
+  </div>
+  <canvas id="game" width="480" height="640"></canvas>
+  <div class="controls-row">
+    <label for="sensitivity">Sensitivity
+      <input type="range" id="sensitivity" min="0.5" max="2" step="0.1" value="1">
+      <span id="sens-value">1.0x</span>
+    </label>
+    <button id="start-btn" type="button">START</button>
+  </div>
+  <p class="hint">Move: Arrows / WASD or drag &nbsp;|&nbsp; Shoot: Space / click / tap &nbsp;|&nbsp; P pause &nbsp;|&nbsp; M mute</p>
+</div>
+<script src="game.js"></script>
+</body>
+</html>
