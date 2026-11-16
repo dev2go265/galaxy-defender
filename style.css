@@ -28,6 +28,7 @@ h1 {
   font-weight: bold;
   padding: 6px 4px;
   color: #ffe14d;
+  text-shadow: 0 0 8px rgba(255, 225, 77, 0.55);
 }
 #hud-lives { color: #ff5d73; letter-spacing: 2px; }
 canvas {
